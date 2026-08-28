@@ -33,6 +33,7 @@ see [Troubleshooting](#troubleshooting) if that happens.
 | `gpx/`              | Every downloaded GPX file lands here. This is the source of truth. |
 | `.garmin_tokens/`   | Cached login session. Delete this to force a fresh login.           |
 | `state.json`        | List of activity IDs already downloaded (used to skip re-downloads).|
+| `status.json`       | Human-readable manifest of every downloaded activity, sorted by activity date (not download date). See [Status file](#status-file). |
 | `sync.log`          | Timestamped log of every run (also mirrored to the console when run interactively). |
 
 ## Setup
@@ -94,6 +95,27 @@ training data — pass `--copy-to`:
 The destination directory is created automatically if it doesn't exist.
 This can be combined with `--all` for the initial backfill.
 
+### Status file
+
+`status.json` is a manifest of every activity that has ever been downloaded,
+rewritten in full after each run and always sorted by the activity's own
+date (`startTimeGMT`) — not by when it happened to be downloaded. Each entry:
+
+```json
+{
+  "activityId": 24114635005,
+  "activityName": "Roma - Ripetizioni 10 X 2 min - 10 x 1",
+  "startTimeGMT": "2026-08-25 16:58:20",
+  "filename": "2026-08-25_16-58-20_24114635005_Roma_-_Ripetizioni_10_X_2_min_-_10_x_1.gpx"
+}
+```
+
+This is meant to be read, not relied on for correctness — `state.json` is
+what the script actually checks to decide what's new. If you ever manually
+edit or delete entries in `state.json`, `status.json` won't automatically
+match afterwards; it's rebuilt incrementally as activities are downloaded,
+not derived fresh from `gpx/` on each run.
+
 ## Scheduling with cron
 
 Once the first manual login above has succeeded, schedule recurring runs:
@@ -152,6 +174,14 @@ Check `state.json` — if an activity ID is already listed there, it's treated
 as already downloaded and skipped even if the file is missing from `gpx/`.
 Remove its ID from `state.json` (or delete the whole file to reset tracking)
 to force it to be re-downloaded.
+
+**Resetting tracking to force a full re-download**
+Delete `state.json` and `status.json` outright rather than emptying them to
+zero bytes — an empty file is treated the same as "no state" (so this is
+safe), but do it with `rm`, not by truncating to blank in an editor, just to
+avoid confusion about what state the files are in. Then run again (with
+`--all` if you want the full history re-downloaded, not just the most
+recent window).
 
 **The same activities get re-downloaded on every run**
 `state.json` should grow to include every activity ID ever downloaded and

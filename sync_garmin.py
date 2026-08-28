@@ -26,6 +26,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TOKEN_DIR = BASE_DIR / ".garmin_tokens"
 GPX_DIR = BASE_DIR / "gpx"
 STATE_FILE = BASE_DIR / "state.json"
+STATUS_FILE = BASE_DIR / "status.json"
 LOG_FILE = BASE_DIR / "sync.log"
 
 # How many of the most recent activities to check each run. Must be
@@ -71,12 +72,27 @@ def parse_args():
 
 def load_state():
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+        text = STATE_FILE.read_text().strip()
+        if text:
+            return json.loads(text)
     return {"seen_ids": []}
 
 
 def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def load_status():
+    if STATUS_FILE.exists():
+        text = STATUS_FILE.read_text().strip()
+        if text:
+            return {entry["activityId"]: entry for entry in json.loads(text)}
+    return {}
+
+
+def save_status(status_by_id):
+    entries = sorted(status_by_id.values(), key=lambda e: e["startTimeGMT"])
+    STATUS_FILE.write_text(json.dumps(entries, indent=2))
 
 
 def login():
@@ -128,6 +144,13 @@ def slugify(name):
     return name or "activity"
 
 
+def gpx_filename(activity):
+    activity_id = activity["activityId"]
+    name = slugify(activity.get("activityName"))
+    start = activity["startTimeGMT"].replace(" ", "_").replace(":", "-")
+    return f"{start}_{activity_id}_{name}.gpx"
+
+
 def fetch_activities(client, full_history):
     if not full_history:
         return client.get_activities(0, RECENT_ACTIVITIES_TO_CHECK)
@@ -154,6 +177,7 @@ def main():
     GPX_DIR.mkdir(parents=True, exist_ok=True)
     state = load_state()
     seen_ids = set(state["seen_ids"])
+    status_by_id = load_status()
 
     client = login()
 
@@ -162,6 +186,23 @@ def main():
     else:
         log.info("Checking the %d most recent activities for new ones...", RECENT_ACTIVITIES_TO_CHECK)
     activities = fetch_activities(client, args.all)
+
+    # Backfill manifest entries for activities that were already downloaded
+    # (e.g. by a run before status.json existed, or outside the usual
+    # RECENT_ACTIVITIES_TO_CHECK window) but never made it into status.json.
+    for activity in activities:
+        activity_id = activity["activityId"]
+        if activity_id in status_by_id or activity_id not in seen_ids:
+            continue
+        filename = gpx_filename(activity)
+        if (GPX_DIR / filename).exists():
+            status_by_id[activity_id] = {
+                "activityId": activity_id,
+                "activityName": activity.get("activityName"),
+                "startTimeGMT": activity["startTimeGMT"],
+                "filename": filename,
+            }
+
     new_activities = sorted(
         (a for a in activities if a["activityId"] not in seen_ids),
         key=lambda a: a["startTimeGMT"],
@@ -169,6 +210,7 @@ def main():
 
     if not new_activities:
         log.info("No new activities.")
+        save_status(status_by_id)
         return
 
     total = len(new_activities)
@@ -176,10 +218,9 @@ def main():
 
     for i, activity in enumerate(new_activities, start=1):
         activity_id = activity["activityId"]
-        name = slugify(activity.get("activityName"))
-        start = activity["startTimeGMT"].replace(" ", "_").replace(":", "-")
-        filename = f"{start}_{activity_id}_{name}.gpx"
+        filename = gpx_filename(activity)
         out_path = GPX_DIR / filename
+        start = activity["startTimeGMT"].replace(" ", "_").replace(":", "-")
 
         log.info("[%d/%d] Downloading '%s' (%s)...", i, total, activity.get("activityName"), start)
         try:
@@ -194,6 +235,13 @@ def main():
         seen_ids.add(activity_id)
         log.info("  saved to %s", out_path)
 
+        status_by_id[activity_id] = {
+            "activityId": activity_id,
+            "activityName": activity.get("activityName"),
+            "startTimeGMT": activity["startTimeGMT"],
+            "filename": filename,
+        }
+
         if copy_to is not None:
             try:
                 shutil.copy2(out_path, copy_to / filename)
@@ -203,6 +251,7 @@ def main():
 
     state["seen_ids"] = list(seen_ids)
     save_state(state)
+    save_status(status_by_id)
 
 
 if __name__ == "__main__":
