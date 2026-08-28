@@ -152,3 +152,14 @@ Check `state.json` — if an activity ID is already listed there, it's treated
 as already downloaded and skipped even if the file is missing from `gpx/`.
 Remove its ID from `state.json` (or delete the whole file to reset tracking)
 to force it to be re-downloaded.
+
+**The same activities get re-downloaded on every run**
+`state.json` should grow to include every activity ID ever downloaded and
+never lose track of them. If you see this, check the size of the
+`seen_ids` list in `state.json` — it should keep growing over time and
+never shrink. (An earlier version of this script capped it at 500 entries
+using `list[-500:]`, which silently dropped a pseudo-random subset of IDs
+each run because `seen_ids` is a Python `set` — sets have no meaningful
+order, so "last 500" wasn't "500 most recent." That cap has been removed;
+the file is tiny even with thousands of entries, so there's no need to cap
+it.)

@@ -76,7 +76,6 @@ def load_state():
 
 
 def save_state(state):
-    state["seen_ids"] = state["seen_ids"][-500:]
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
