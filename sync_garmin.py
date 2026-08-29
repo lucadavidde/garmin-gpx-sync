@@ -13,6 +13,7 @@ credential is missing or expired when run non-interactively, it logs
 an error and exits instead of hanging on a login prompt.
 """
 import argparse
+import io
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
 
 BASE_DIR = Path(__file__).resolve().parent
 TOKEN_DIR = BASE_DIR / ".garmin_tokens"
@@ -46,6 +47,15 @@ GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 # Optional: ID of the Drive folder to upload into (the part after
 # /folders/ in the folder's URL). If unset, files go to "My Drive" root.
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
+
+# A small, most-recent-first excerpt of status.json, kept under this size
+# and re-uploaded (in place, same Drive file) after every run — handy for
+# glancing at recent activity from somewhere that doesn't want to fetch the
+# full manifest or the GPX files themselves.
+STATUS_EXCERPT_FILE = BASE_DIR / "status_excerpt.json"
+STATUS_EXCERPT_MAX_BYTES = 10 * 1024
+GDRIVE_STATUS_EXCERPT_NAME = "status_excerpt.json"
+GDRIVE_STATUS_EXCERPT_ID_FILE = BASE_DIR / ".gdrive_status_excerpt_id"
 
 # How many of the most recent activities to check each run. Must be
 # comfortably larger than the number of activities you'd log between
@@ -119,6 +129,81 @@ def load_status():
 def save_status(status_by_id):
     entries = sorted(status_by_id.values(), key=lambda e: e["startTimeGMT"])
     STATUS_FILE.write_text(json.dumps(entries, indent=2))
+
+
+def build_status_excerpt(max_bytes=STATUS_EXCERPT_MAX_BYTES):
+    """Read the already-written status.json and return the most recent
+    activities (newest first) as indented JSON, keeping only as many as
+    fit within max_bytes."""
+    if not STATUS_FILE.exists():
+        return json.dumps([], indent=2)
+    text = STATUS_FILE.read_text().strip()
+    entries = json.loads(text) if text else []
+
+    newest_first = sorted(entries, key=lambda e: e["startTimeGMT"], reverse=True)
+    kept = []
+    for entry in newest_first:
+        candidate = kept + [entry]
+        serialized = json.dumps(candidate, indent=2)
+        if len(serialized.encode("utf-8")) > max_bytes:
+            break
+        kept = candidate
+    return json.dumps(kept, indent=2)
+
+
+def save_status_excerpt():
+    excerpt_json = build_status_excerpt()
+    STATUS_EXCERPT_FILE.write_text(excerpt_json)
+    return excerpt_json
+
+
+def upload_status_excerpt(service, excerpt_json):
+    """Create or update the status.json excerpt on Drive. Reuses the same
+    Drive file across runs (its ID is cached locally) so this updates one
+    file in place instead of creating a new one every time."""
+    media = MediaIoBaseUpload(
+        io.BytesIO(excerpt_json.encode("utf-8")), mimetype="application/json", resumable=False
+    )
+
+    file_id = None
+    if GDRIVE_STATUS_EXCERPT_ID_FILE.exists():
+        file_id = GDRIVE_STATUS_EXCERPT_ID_FILE.read_text().strip() or None
+
+    if file_id:
+        try:
+            service.files().update(fileId=file_id, media_body=media).execute()
+            return file_id
+        except HttpError as exc:
+            if exc.resp.status == 404:
+                log.warning("Cached status excerpt Drive file no longer exists; creating a new one.")
+                file_id = None
+            else:
+                raise
+
+    metadata = {"name": GDRIVE_STATUS_EXCERPT_NAME}
+    if GDRIVE_FOLDER_ID:
+        metadata["parents"] = [GDRIVE_FOLDER_ID]
+    uploaded = service.files().create(body=metadata, media_body=media, fields="id").execute()
+    file_id = uploaded["id"]
+    GDRIVE_STATUS_EXCERPT_ID_FILE.write_text(file_id)
+    return file_id
+
+
+def finalize_status(status_by_id, gdrive_service):
+    """Persist status.json, then — when Drive uploads are enabled — build
+    status_excerpt.json straight from the just-written status.json and
+    push it (locally and to Drive) too. Called at every exit point of
+    main() so the excerpt always reflects the latest run, even one that
+    found no new activities."""
+    save_status(status_by_id)
+    if gdrive_service is None:
+        return
+    excerpt_json = save_status_excerpt()
+    try:
+        upload_status_excerpt(gdrive_service, excerpt_json)
+        log.info("  updated status excerpt on Google Drive.")
+    except HttpError as exc:
+        log.error("  failed to upload status excerpt to Google Drive: %s", exc)
 
 
 def login():
@@ -309,7 +394,7 @@ def main():
 
     if not new_activities:
         log.info("No new activities.")
-        save_status(status_by_id)
+        finalize_status(status_by_id, gdrive_service)
         return
 
     total = len(new_activities)
@@ -359,7 +444,7 @@ def main():
 
     state["seen_ids"] = list(seen_ids)
     save_state(state)
-    save_status(status_by_id)
+    finalize_status(status_by_id, gdrive_service)
 
 
 if __name__ == "__main__":

@@ -17,9 +17,12 @@ and caches a session token afterwards. This script wraps that library to:
 3. Download any activity not already downloaded, as GPX, into `gpx/`.
 4. Upload each newly downloaded GPX file to Google Drive via the Drive API,
    and record its Drive link. See [Google Drive setup](#google-drive-setup).
-5. Optionally copy each new GPX file into another local directory of your
+5. Keep a small `status_excerpt.json` — the most recent activities from
+   `status.json`, capped at 10KB — updated in place on Drive after every
+   run. See [Status excerpt](#status-excerpt).
+6. Optionally copy each new GPX file into another local directory of your
    choice too.
-6. Remember which activities it has already downloaded, so the next run only
+7. Remember which activities it has already downloaded, so the next run only
    fetches what's new.
 
 Because this relies on an unofficial/reverse-engineered login flow rather
@@ -41,6 +44,8 @@ side uses Google's official, supported API.)
 | `.gdrive_token.json`     | Cached Google Drive authorization. Delete this to force re-consent. |
 | `state.json`             | List of activity IDs already downloaded (used to skip re-downloads).|
 | `status.json`            | Human-readable manifest of every downloaded activity, including its Drive link, sorted by activity date (not download date). See [Status file](#status-file). |
+| `status_excerpt.json`    | The most recent activities from `status.json`, capped at 10KB, also kept updated on Drive. See [Status excerpt](#status-excerpt). |
+| `.gdrive_status_excerpt_id` | Cached Drive file ID for `status_excerpt.json`, so it's updated in place on Drive instead of re-created every run. |
 | `sync.log`               | Timestamped log of every run (also mirrored to the console when run interactively). |
 
 ## Setup
@@ -172,6 +177,22 @@ what the script actually checks to decide what's new. If you ever manually
 edit or delete entries in `state.json`, `status.json` won't automatically
 match afterwards; it's rebuilt incrementally as activities are downloaded,
 not derived fresh from `gpx/` on each run.
+
+### Status excerpt
+
+`status_excerpt.json` is a trimmed, newest-first copy of `status.json`,
+capped at 10KB (`STATUS_EXCERPT_MAX_BYTES` in `sync_garmin.py`) — as many of
+your most recent activities as fit in that budget, same entry format as
+`status.json`. It's built by reading `status.json` right after it's
+written, not from a separate in-memory copy, so it's always exactly
+consistent with what's on disk. It's written locally on every run, and —
+as long as Drive uploads are enabled — the same file is created once on
+Drive and then *updated in place* on every subsequent run (its Drive file
+ID is cached in `.gdrive_status_excerpt_id`), so you always have one
+small, current file to check recent activity from without pulling the full
+manifest or any GPX files. It's regenerated even on runs with no new
+activities, so it stays in sync if `status.json` was backfilled (e.g. new
+`gdriveLink`s added).
 
 ## Scheduling with cron
 
