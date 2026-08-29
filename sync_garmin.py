@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Download new Garmin Connect activities as GPX files.
+"""Download new Garmin Connect activities as GPX files and upload them to
+Google Drive.
 
 First run must be done manually (interactively) to log in and cache a
-session token:
+Garmin session token, and to complete the Google Drive OAuth consent:
 
     ./venv/bin/python sync_garmin.py
 
-After that, this script reuses the cached token and can be run
-unattended from cron. If the cached token is missing or expired when
-run non-interactively, it logs an error and exits instead of hanging
-on a password prompt.
+After that, this script reuses the cached Garmin token and Drive
+credentials and can be run unattended from cron. If either cached
+credential is missing or expired when run non-interactively, it logs
+an error and exits instead of hanging on a login prompt.
 """
 import argparse
 import json
 import logging
+import os
 import re
 import shutil
 import sys
@@ -21,6 +23,12 @@ from getpass import getpass
 from pathlib import Path
 
 from garminconnect import Garmin
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaFileUpload
 
 BASE_DIR = Path(__file__).resolve().parent
 TOKEN_DIR = BASE_DIR / ".garmin_tokens"
@@ -28,6 +36,16 @@ GPX_DIR = BASE_DIR / "gpx"
 STATE_FILE = BASE_DIR / "state.json"
 STATUS_FILE = BASE_DIR / "status.json"
 LOG_FILE = BASE_DIR / "sync.log"
+
+# Google Drive OAuth client (downloaded from Google Cloud Console) and the
+# token cached after the first interactive consent. See the "Google Drive
+# setup" section of the README.
+GDRIVE_CREDENTIALS_FILE = BASE_DIR / "gdrive_credentials.json"
+GDRIVE_TOKEN_FILE = BASE_DIR / ".gdrive_token.json"
+GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+# Optional: ID of the Drive folder to upload into (the part after
+# /folders/ in the folder's URL). If unset, files go to "My Drive" root.
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
 
 # How many of the most recent activities to check each run. Must be
 # comfortably larger than the number of activities you'd log between
@@ -65,6 +83,14 @@ def parse_args():
             "Page through your entire activity history instead of only the "
             f"{RECENT_ACTIVITIES_TO_CHECK} most recent activities. Use this "
             "once for an initial backfill; not needed for routine runs."
+        ),
+    )
+    parser.add_argument(
+        "--no-gdrive",
+        action="store_true",
+        help=(
+            "Skip uploading to Google Drive entirely (GPX files are still "
+            "saved locally to gpx/, just without a gdriveLink in status.json)."
         ),
     )
     return parser.parse_args()
@@ -139,6 +165,61 @@ def login():
     return client
 
 
+def gdrive_login():
+    """Return an authorized Drive API client, refreshing or creating the
+    cached token as needed. Mirrors the Garmin login()'s
+    interactive-first-run / cached-token-after pattern."""
+    creds = None
+    if GDRIVE_TOKEN_FILE.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(str(GDRIVE_TOKEN_FILE), GDRIVE_SCOPES)
+        except (ValueError, json.JSONDecodeError) as exc:
+            log.warning("Cached Google Drive token unreadable (%s); need to re-authorize.", exc)
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception as exc:
+            log.warning("Could not refresh Google Drive token (%s); need to re-authorize.", exc)
+            creds = None
+
+    if not creds or not creds.valid:
+        if not sys.stdin.isatty():
+            log.error(
+                "No valid cached Google Drive token and not running interactively. "
+                "Run 'venv/bin/python sync_garmin.py' by hand once to authorize Drive access "
+                "(or pass --no-gdrive to skip uploads for this run)."
+            )
+            sys.exit(1)
+        if not GDRIVE_CREDENTIALS_FILE.exists():
+            log.error(
+                "Missing %s. Download an OAuth client ID (Desktop app) from Google Cloud "
+                "Console and save it there — see the README's Google Drive setup section.",
+                GDRIVE_CREDENTIALS_FILE,
+            )
+            sys.exit(1)
+        flow = InstalledAppFlow.from_client_secrets_file(str(GDRIVE_CREDENTIALS_FILE), GDRIVE_SCOPES)
+        creds = flow.run_local_server(port=0)
+        GDRIVE_TOKEN_FILE.write_text(creds.to_json())
+        print(f"Google Drive authorization cached to {GDRIVE_TOKEN_FILE} for future unattended runs.")
+
+    return build("drive", "v3", credentials=creds)
+
+
+def upload_to_gdrive(service, path, filename):
+    """Upload a single GPX file to Drive and return a shareable link."""
+    metadata = {"name": filename}
+    if GDRIVE_FOLDER_ID:
+        metadata["parents"] = [GDRIVE_FOLDER_ID]
+    media = MediaFileUpload(str(path), mimetype="application/gpx+xml", resumable=False)
+    uploaded = (
+        service.files()
+        .create(body=metadata, media_body=media, fields="id, webViewLink")
+        .execute()
+    )
+    return uploaded.get("webViewLink") or f"https://drive.google.com/file/d/{uploaded['id']}/view"
+
+
 def slugify(name):
     name = re.sub(r"[^\w\-]+", "_", name or "").strip("_")
     return name or "activity"
@@ -180,6 +261,7 @@ def main():
     status_by_id = load_status()
 
     client = login()
+    gdrive_service = None if args.no_gdrive else gdrive_login()
 
     if args.all:
         log.info("Paging through your entire activity history...")
@@ -202,6 +284,23 @@ def main():
                 "startTimeGMT": activity["startTimeGMT"],
                 "filename": filename,
             }
+
+    # Backfill Drive links for entries that already exist in status.json
+    # (or were just backfilled above) but don't have one yet — e.g. GPX
+    # files downloaded before Drive upload support existed, or a prior run
+    # where the upload failed.
+    if gdrive_service is not None:
+        for activity_id, entry in status_by_id.items():
+            if entry.get("gdriveLink"):
+                continue
+            local_path = GPX_DIR / entry["filename"]
+            if not local_path.exists():
+                continue
+            try:
+                entry["gdriveLink"] = upload_to_gdrive(gdrive_service, local_path, entry["filename"])
+                log.info("  backfilled Drive upload for %s", entry["filename"])
+            except HttpError as exc:
+                log.error("  failed to backfill Drive upload for %s: %s", entry["filename"], exc)
 
     new_activities = sorted(
         (a for a in activities if a["activityId"] not in seen_ids),
@@ -235,12 +334,21 @@ def main():
         seen_ids.add(activity_id)
         log.info("  saved to %s", out_path)
 
-        status_by_id[activity_id] = {
+        status_entry = {
             "activityId": activity_id,
             "activityName": activity.get("activityName"),
             "startTimeGMT": activity["startTimeGMT"],
             "filename": filename,
         }
+
+        if gdrive_service is not None:
+            try:
+                status_entry["gdriveLink"] = upload_to_gdrive(gdrive_service, out_path, filename)
+                log.info("  uploaded to Google Drive: %s", status_entry["gdriveLink"])
+            except HttpError as exc:
+                log.error("  failed to upload %s to Google Drive: %s", filename, exc)
+
+        status_by_id[activity_id] = status_entry
 
         if copy_to is not None:
             try:

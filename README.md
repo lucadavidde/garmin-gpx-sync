@@ -1,7 +1,8 @@
 # garmin-gpx-sync
 
 Downloads your Garmin Connect activities as GPX files, on a schedule, without
-re-downloading anything you already have.
+re-downloading anything you already have — and uploads each one straight to
+Google Drive.
 
 ## How it works
 
@@ -14,27 +15,33 @@ and caches a session token afterwards. This script wraps that library to:
    needed for scheduled runs).
 2. Fetch your recent activities.
 3. Download any activity not already downloaded, as GPX, into `gpx/`.
-4. Optionally copy each new GPX file into another directory of your choice.
-5. Remember which activities it has already downloaded, so the next run only
+4. Upload each newly downloaded GPX file to Google Drive via the Drive API,
+   and record its Drive link. See [Google Drive setup](#google-drive-setup).
+5. Optionally copy each new GPX file into another local directory of your
+   choice too.
+6. Remember which activities it has already downloaded, so the next run only
    fetches what's new.
 
 Because this relies on an unofficial/reverse-engineered login flow rather
 than a supported API, it can break if Garmin changes their login process —
-see [Troubleshooting](#troubleshooting) if that happens.
+see [Troubleshooting](#troubleshooting) if that happens. (The Google Drive
+side uses Google's official, supported API.)
 
 ## Files in this project
 
-| Path                | Purpose                                                             |
-|---------------------|----------------------------------------------------------------------|
-| `sync_garmin.py`    | The script itself.                                                  |
-| `run.sh`            | Wrapper for cron — activates the venv and forwards any arguments.   |
-| `requirements.txt`  | Python dependencies (`garminconnect`).                              |
-| `venv/`             | Isolated virtualenv (not portable between machines — see Setup).    |
-| `gpx/`              | Every downloaded GPX file lands here. This is the source of truth. |
-| `.garmin_tokens/`   | Cached login session. Delete this to force a fresh login.           |
-| `state.json`        | List of activity IDs already downloaded (used to skip re-downloads).|
-| `status.json`       | Human-readable manifest of every downloaded activity, sorted by activity date (not download date). See [Status file](#status-file). |
-| `sync.log`          | Timestamped log of every run (also mirrored to the console when run interactively). |
+| Path                     | Purpose                                                             |
+|--------------------------|----------------------------------------------------------------------|
+| `sync_garmin.py`         | The script itself.                                                  |
+| `run.sh`                 | Wrapper for cron — activates the venv and forwards any arguments.   |
+| `requirements.txt`       | Python dependencies (`garminconnect`, Google API client libraries). |
+| `venv/`                  | Isolated virtualenv (not portable between machines — see Setup).    |
+| `gpx/`                   | Every downloaded GPX file lands here. This is the local source of truth, independent of Drive upload success. |
+| `.garmin_tokens/`        | Cached Garmin login session. Delete this to force a fresh login.    |
+| `gdrive_credentials.json`| OAuth client ID downloaded from Google Cloud Console (you provide this — not committed to git). |
+| `.gdrive_token.json`     | Cached Google Drive authorization. Delete this to force re-consent. |
+| `state.json`             | List of activity IDs already downloaded (used to skip re-downloads).|
+| `status.json`            | Human-readable manifest of every downloaded activity, including its Drive link, sorted by activity date (not download date). See [Status file](#status-file). |
+| `sync.log`               | Timestamped log of every run (also mirrored to the console when run interactively). |
 
 ## Setup
 
@@ -67,6 +74,49 @@ you have that enabled on your account):
 On success it caches your session to `.garmin_tokens/` and downloads your
 recent activities into `gpx/`. Every run after this reuses that cached
 session — no credentials needed again unless the token expires or is deleted.
+
+The first run will also open a browser window for Google Drive consent (see
+[Google Drive setup](#google-drive-setup) below) — complete that setup
+first, otherwise the script exits before downloading anything.
+
+## Google Drive setup
+
+Uploads use the official Google Drive API with the narrow `drive.file`
+scope, which only lets the app see files *it* creates — not your whole
+Drive.
+
+1. In the [Google Cloud Console](https://console.cloud.google.com/), create
+   a project (or reuse one) and enable the **Google Drive API** under
+   "APIs & Services" → "Library".
+2. Under "APIs & Services" → "Credentials", click "Create Credentials" →
+   "OAuth client ID". If prompted, configure the OAuth consent screen first
+   (choose "External" and add your own Google account as a test user, unless
+   you have a Workspace account).
+3. For the client ID's application type, choose **Desktop app**.
+4. Download the resulting JSON file, and save it in this project's root as
+   `gdrive_credentials.json`.
+5. (Optional) If you want uploads to land in a specific folder instead of
+   the root of "My Drive", open that folder in Drive, copy the ID from its
+   URL (`https://drive.google.com/drive/folders/<FOLDER_ID>`), and set it as
+   an environment variable before running (e.g. add
+   `export GDRIVE_FOLDER_ID=<FOLDER_ID>` to your shell profile, or prefix
+   the cron command with it).
+
+The first run (see above) opens a browser to complete the consent flow and
+caches the resulting token to `.gdrive_token.json`; subsequent runs (manual
+or cron) reuse it silently, refreshing it automatically when it expires.
+
+**Running the first-run consent over SSH:** `flow.run_local_server()` needs
+a browser reachable from the machine running the script. If you're setting
+this up on a headless server over SSH, either run the first manual login on
+your local machine and copy `.gdrive_token.json` (and
+`gdrive_credentials.json`) over to the server afterwards, or forward the
+port it listens on (e.g. `ssh -L 8080:localhost:8080 your-server`) and open
+the printed URL in your local browser.
+
+If you'd rather skip Drive entirely for a given run (e.g. while testing),
+pass `--no-gdrive` — GPX files are still downloaded and saved locally, just
+without a `gdriveLink`.
 
 ### One-time full history backfill
 
@@ -106,9 +156,16 @@ date (`startTimeGMT`) — not by when it happened to be downloaded. Each entry:
   "activityId": 24114635005,
   "activityName": "Roma - Ripetizioni 10 X 2 min - 10 x 1",
   "startTimeGMT": "2026-08-25 16:58:20",
-  "filename": "2026-08-25_16-58-20_24114635005_Roma_-_Ripetizioni_10_X_2_min_-_10_x_1.gpx"
+  "filename": "2026-08-25_16-58-20_24114635005_Roma_-_Ripetizioni_10_X_2_min_-_10_x_1.gpx",
+  "gdriveLink": "https://drive.google.com/file/d/1a2B3c.../view"
 }
 ```
+
+`gdriveLink` is added once the file has been successfully uploaded to Drive.
+It's absent for entries from a run that used `--no-gdrive`, or if the
+upload failed (check `sync.log`) — in either case the next run without
+`--no-gdrive` will retry the upload for any entry still missing a link, as
+long as the file is still present in `gpx/`.
 
 This is meant to be read, not relied on for correctness — `state.json` is
 what the script actually checks to decide what's new. If you ever manually
@@ -164,6 +221,26 @@ in `site-packages`) and adjust the `login()` function's fallback logic in
 **MFA / two-factor prompts**
 Handled automatically during the interactive first-run login — you'll be
 prompted for the code in the terminal.
+
+**Cron run logs "No valid cached Google Drive token and not running interactively"**
+Same idea as the Garmin equivalent above: `.gdrive_token.json` is missing,
+expired, or its refresh token was revoked (e.g. you removed the app's
+access under your Google Account's third-party access settings). Fix by
+rerunning the manual login once to redo the consent flow, or add
+`--no-gdrive` to the cron command if you want to disable Drive uploads.
+
+**`FileNotFoundError` or login error mentioning `gdrive_credentials.json`**
+You haven't downloaded the OAuth client ID from Google Cloud Console yet, or
+saved it under a different name/location. See
+[Google Drive setup](#google-drive-setup).
+
+**Some entries in `status.json` have no `gdriveLink`**
+Either they were downloaded with `--no-gdrive`, or the upload failed for
+that file (check `sync.log` for the specific error — a common cause is the
+Drive API not being enabled on your Google Cloud project, or the daily
+upload quota being hit). Just run again without `--no-gdrive`: any entry
+still missing a link, whose GPX file is still in `gpx/`, gets its upload
+retried automatically.
 
 **Activities are missing from before a certain date**
 See [One-time full history backfill](#one-time-full-history-backfill) above
