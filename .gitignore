@@ -1,17 +1,14 @@
 # Virtualenv (rebuild per-machine, don't commit)
 venv/
-
 # Login session cache - contains auth tokens
 .garmin_tokens/
 .gdrive_token.json
 gdrive_credentials.json
-
 # Downloaded/generated data - personal, not source
 gpx/
 state.json
 status.json
 sync.log
-
 # Python
 __pycache__/
 *.pyc
