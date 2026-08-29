@@ -171,14 +171,26 @@ def upload_status_excerpt(service, excerpt_json):
 
     if file_id:
         try:
-            service.files().update(fileId=file_id, media_body=media).execute()
-            return file_id
+            # A file "deleted" from the Drive UI is normally just moved to
+            # Trash, not actually removed — its ID stays valid, so a plain
+            # update() would silently succeed against the trashed copy
+            # instead of surfacing a 404. Check for that explicitly and
+            # treat a trashed (or genuinely missing) file the same way:
+            # fall through and create a fresh one.
+            existing = service.files().get(fileId=file_id, fields="id, trashed").execute()
+            if existing.get("trashed"):
+                log.warning("Cached status excerpt Drive file is in Trash; creating a new one.")
+                file_id = None
         except HttpError as exc:
             if exc.resp.status == 404:
                 log.warning("Cached status excerpt Drive file no longer exists; creating a new one.")
                 file_id = None
             else:
                 raise
+
+    if file_id:
+        service.files().update(fileId=file_id, media_body=media).execute()
+        return file_id
 
     metadata = {"name": GDRIVE_STATUS_EXCERPT_NAME}
     if GDRIVE_FOLDER_ID:
