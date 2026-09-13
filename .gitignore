@@ -6,11 +6,10 @@ venv/
 gdrive_credentials.json
 # Downloaded/generated data - personal, not source
 gpx/
-state.json
+fit/
 status.json
 sync.log
 # Python
 __pycache__/
 *.pyc
-status_excerpt.json
 .gdrive_status_excerpt_id
