@@ -112,7 +112,12 @@ Drive.
    URL (`https://drive.google.com/drive/folders/<FOLDER_ID>`), and set it as
    an environment variable before running (e.g. add
    `export GDRIVE_FOLDER_ID=<FOLDER_ID>` to your shell profile, or prefix
-   the cron command with it).
+   the cron command with it). This applies to both formats. To put `.gpx`
+   and `.fit` uploads in *separate* Drive folders instead, set
+   `GDRIVE_FOLDER_ID_GPX` and/or `GDRIVE_FOLDER_ID_FIT` — each overrides
+   `GDRIVE_FOLDER_ID` for just that format; any format without its own
+   override falls back to `GDRIVE_FOLDER_ID` (or Drive root if that's unset
+   too).
 
 The first run (see above) opens a browser to complete the consent flow and
 caches the resulting token to `.gdrive_token.json`; subsequent runs (manual

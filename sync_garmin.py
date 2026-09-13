@@ -48,7 +48,16 @@ GDRIVE_TOKEN_FILE = BASE_DIR / ".gdrive_token.json"
 GDRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 # Optional: ID of the Drive folder to upload into (the part after
 # /folders/ in the folder's URL). If unset, files go to "My Drive" root.
+# Per-format overrides (GDRIVE_FOLDER_ID_GPX / GDRIVE_FOLDER_ID_FIT) take
+# priority over this one, so gpx/ and fit/ can land in separate Drive
+# folders — set just this one for a single shared folder, or the per-format
+# ones too for a split layout.
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
+FORMAT_GDRIVE_FOLDER_ENV = {"gpx": "GDRIVE_FOLDER_ID_GPX", "fit": "GDRIVE_FOLDER_ID_FIT"}
+
+
+def gdrive_folder_id_for(fmt):
+    return os.environ.get(FORMAT_GDRIVE_FOLDER_ENV[fmt]) or GDRIVE_FOLDER_ID
 
 # A small, most-recent-first excerpt of status.json, kept under this size and
 # re-uploaded (in place, same Drive file) after every run — handy for
@@ -309,11 +318,11 @@ def gdrive_login():
     return build("drive", "v3", credentials=creds)
 
 
-def upload_to_gdrive(service, path, filename, mimetype):
+def upload_to_gdrive(service, path, filename, mimetype, folder_id):
     """Upload a single file to Drive and return a shareable link."""
     metadata = {"name": filename}
-    if GDRIVE_FOLDER_ID:
-        metadata["parents"] = [GDRIVE_FOLDER_ID]
+    if folder_id:
+        metadata["parents"] = [folder_id]
     media = MediaFileUpload(str(path), mimetype=mimetype, resumable=False)
     uploaded = (
         service.files()
@@ -394,10 +403,11 @@ def save_format_download(entry, fmt, activity, payloads):
 
 
 def upload_format_files(gdrive_service, entry, fmt, written):
+    folder_id = gdrive_folder_id_for(fmt)
     links = []
     for filename, path in written:
         try:
-            link = upload_to_gdrive(gdrive_service, path, filename, FORMAT_MIMETYPES[fmt])
+            link = upload_to_gdrive(gdrive_service, path, filename, FORMAT_MIMETYPES[fmt], folder_id)
             log.info("  uploaded to Google Drive: %s", link)
             links.append(link)
         except HttpError as exc:
@@ -417,13 +427,14 @@ def backfill_gdrive_links(gdrive_service, status_by_id, requested):
     set together rather than tracking partial success per file."""
     for entry in status_by_id.values():
         for fmt in requested:
+            folder_id = gdrive_folder_id_for(fmt)
             filename = entry.get(f"{fmt}_filename")
             if filename and not entry.get(f"{fmt}_gdriveLink"):
                 local_path = FORMAT_DIRS[fmt] / filename
                 if local_path.exists():
                     try:
                         entry[f"{fmt}_gdriveLink"] = upload_to_gdrive(
-                            gdrive_service, local_path, filename, FORMAT_MIMETYPES[fmt]
+                            gdrive_service, local_path, filename, FORMAT_MIMETYPES[fmt], folder_id
                         )
                         log.info("  backfilled Drive upload for %s", filename)
                     except HttpError as exc:
@@ -438,7 +449,9 @@ def backfill_gdrive_links(gdrive_service, status_by_id, requested):
                     if not local_path.exists():
                         continue
                     try:
-                        links.append(upload_to_gdrive(gdrive_service, local_path, fn, FORMAT_MIMETYPES[fmt]))
+                        links.append(
+                            upload_to_gdrive(gdrive_service, local_path, fn, FORMAT_MIMETYPES[fmt], folder_id)
+                        )
                         log.info("  backfilled Drive upload for %s", fn)
                     except HttpError as exc:
                         log.error("  failed to backfill Drive upload for %s: %s", fn, exc)
